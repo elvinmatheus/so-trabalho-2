@@ -207,6 +207,8 @@ char data[block_size - sizeof(uint32_t)];
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sys/mman.h> // Include this header for mmap
+#include <linux/mman.h> // Include this header for MAP_ANONYMOUS
 
 #define DISK_SIZE (1ULL * 1024 * 1024 * 1024) // 1 GB
 #define HUGE_PAGE_SIZE (2 * 1024 * 1024) // 2 MB
@@ -221,62 +223,104 @@ typedef struct {
     size_t posicao; 
 } Arquivo;
 
-// typedef struct {
-//     unsigned char bitmap[NUM_BLOCKS / 8]; // 1 bit por bloco (array de bytes)
-//     Arquivo arquivos[MAX_FILES];
-//     size_t quantidade_arquivos;
-//     size_t espaco_livre;
-// } SistemaDeArquivos;
-
 typedef struct {
+    unsigned char bitmap[NUM_BLOCKS / 8]; // 1 bit por bloco (array de bytes)
     Arquivo arquivos[MAX_FILES];
     size_t quantidade_arquivos;
     size_t espaco_livre;
 } SistemaDeArquivos;
 
+// typedef struct {
+//     Arquivo arquivos[MAX_FILES];
+//     size_t quantidade_arquivos;
+//     size_t espaco_livre;
+// } SistemaDeArquivos;
+
 SistemaDeArquivos sa;
 FILE* disco_virtual;
-// void* huge_page = NULL;
+void* huge_page = NULL;
 
 // Inicialização
 void iniciar_sistema_arquivos() {
+    printf("Iniciando sistema de arquivos\n");
     disco_virtual = fopen("disco_virtual.bin", "r+b");
     if (!disco_virtual) {
         disco_virtual = fopen("disco_virtual.bin", "w+b");
-        fseek(disco_virtual, DISK_SIZE - 1, SEEK_SET);
-        fputc('\0', disco_virtual);
-        fclose(disco_virtual);
-        disco_virtual = fopen("disco_virtual.bin", "r+b");
+        fseek(disco_virtual, DISK_SIZE - 1, SEEK_SET); // Define tamanho do arquivo
+        fputc('\0', disco_virtual); // Escreve um byte nulo no final
+        fclose(disco_virtual); // Fecha o arquivo
+        disco_virtual = fopen("disco_virtual.bin", "r+b"); // Reabre o arquivo
     }
     sa.quantidade_arquivos = 0;
     sa.espaco_livre = DISK_SIZE;
+    printf("Sistema de arquivos inicializado\n");
 }
 
-// Comandos
+// Helpers
+int bloco_esta_livre(size_t bloco) {
+    size_t byte_index = bloco / 8; // Índice do byte
+    size_t bit_index = bloco % 8;  // Posição do bit dentro do byte
+    return !(sa.bitmap[byte_index] & (1 << bit_index)); // Retorna 1 se livre, 0 se ocupado
+}
+
+void marcar_bloco_ocupado(size_t bloco) {
+    size_t byte_index = bloco / 8;
+    size_t bit_index = bloco % 8;
+    sa.bitmap[byte_index] |= (1 << bit_index); // Define o bit como 1 (ocupado)
+}
+
+void marcar_bloco_livre(size_t bloco) {
+    size_t byte_index = bloco / 8;
+    size_t bit_index = bloco % 8;
+    sa.bitmap[byte_index] &= ~(1 << bit_index); // Define o bit como 0 (livre)
+}
+
+size_t encontrar_bloco_livre(size_t tamanho) {
+    size_t blocos_necessarios = tamanho / BLOCK_SIZE + (tamanho % BLOCK_SIZE != 0);
+    size_t contador = 0;
+    size_t inicio = -1;
+
+    for (size_t i = 0; i < NUM_BLOCKS; i++) {
+        if (bloco_esta_livre(i)) {
+            if (contador == 0) inicio = i; // Primeiro bloco encontrado
+            contador++;
+
+            if (contador == blocos_necessarios) { // Achou espaço suficiente
+                for (size_t j = inicio; j < inicio + blocos_necessarios; j++) {
+                    marcar_bloco_ocupado(j); // Reservar os blocos
+                }
+                return inicio * BLOCK_SIZE; // Retorna a posição no disco
+            }
+        } else {
+            contador = 0;
+            inicio = -1;
+        }
+    }
+
+    return -1; // Nenhum espaço suficiente encontrado
+}
+
 // Criar
 void criar(const char* nome, int tamanho) {
-    if (sa.quantidade_arquivos >= MAX_FILES) {
-        printf("Erro: Número máximo de arquivos atingido\n");
-        return;
-    }
-    
-    if (strlen(nome) >= MAX_FILENAME_LENGTH) {
-        printf("Erro: Nome do arquivo é muito grande\n");
-        return;
-    }
-    
+
     size_t file_size = tamanho * sizeof(int);
     if (file_size > sa.espaco_livre) {
         printf("Erro: Sem espaço suficiente\n");
         return;
     }
-    
+
+    // Encontrar espaço livre (exemplo: first-fit)
+    size_t posicao = encontrar_bloco_livre(file_size);
+    if (posicao == -1) {
+        printf("Erro: Sem espaço contínuo suficiente\n");
+        return;
+    }
+
     Arquivo* arquivo = &sa.arquivos[sa.quantidade_arquivos++];
-    strcpy(arquivo->nome, nome);
+    strncpy(arquivo->nome, nome, MAX_FILENAME_LENGTH);
     arquivo->tamanho = file_size;
-    arquivo->posicao = DISK_SIZE - sa.espaco_livre;
+    arquivo->posicao = posicao;
     sa.espaco_livre -= file_size;
-    
 
     // Criar e armazenar números aleatórios no arquivo
     int* numbers = malloc(file_size); // Permitido usar
@@ -299,61 +343,7 @@ void criar(const char* nome, int tamanho) {
     printf("Arquivo '%s' criado com sucesso\n", nome);
 }
 
-
-// Listar
-void listar() {
-    printf("Arquivos:\n");
-    for (int i = 0; i < sa.quantidade_arquivos; i++) {
-        printf("%s - %zu bytes\n", sa.arquivos[i].nome, sa.arquivos[i].tamanho);
-    }
-    printf("\nEspaço total: %llu bytes\n", DISK_SIZE);
-    printf("Espaço livre: %zu bytes\n", sa.espaco_livre);
-}
-
-
-// Ler
-void ler(const char* nome, int inicio, int fim) {
-    Arquivo* arquivo = NULL;
-    for (int i = 0; i < sa.quantidade_arquivos; i++) {
-        if (strcmp(sa.arquivos[i].nome, nome) == 0) {
-            arquivo = &sa.arquivos[i];
-            break;
-        }
-    }
-    
-    if (arquivo == NULL) {
-        printf("Error: Arquivo '%s' não encontrado\n", nome);
-        return;
-    }
-
-    int num_count = arquivo->tamanho / sizeof(int);
-    
-    if (inicio < 0 || fim >= num_count || inicio > fim) {
-        printf("Error: Invalid range\n");
-        return;
-    }
-
-    int* buffer = malloc(arquivo->tamanho);
-    if (!buffer) {
-        printf("Erro: Falha ao alocar memória\n");
-        return;
-    }
-
-    fseek(disco_virtual, arquivo->posicao, SEEK_SET);
-    fread(buffer, sizeof(int), num_count, disco_virtual);
-
-    printf("Números %d a %d no arquivo '%s':\n", inicio, fim, nome);
-    for (int i = inicio; i <= fim; i++) {
-        printf("%d ", buffer[i]);
-    }
-    printf("\n");
-
-  // Liberar memória
-  free(buffer);
-}
-
-
-// apagar
+// Apagar
 void apagar(const char* nome) {
     int indice = -1;
 
@@ -374,16 +364,13 @@ void apagar(const char* nome) {
     Arquivo* arquivo = &sa.arquivos[indice];
 
     // Limpar o espaço do arquivo no disco
-    char* buffer = calloc(1, arquivo->tamanho);  // Buffer zerado
-    if (!buffer) {
-        printf("Erro: Falha ao alocar memória para apagar arquivo\n");
-        return;
+    // Liberar os blocos no bitmap
+    size_t bloco_inicial = arquivo->posicao / BLOCK_SIZE;
+    size_t num_blocos = arquivo->tamanho / BLOCK_SIZE;
+    
+    for (size_t i = 0; i < num_blocos; i++) {
+        sa.bitmap[bloco_inicial + i] = 0;  // Marca o bloco como livre
     }
-
-    fseek(disco_virtual, arquivo->posicao, SEEK_SET);
-    fwrite(buffer, 1, arquivo->tamanho, disco_virtual);
-    fflush(disco_virtual);  // Garante que os dados são gravados
-    free(buffer);  // Libera a memória
 
     // Atualizar espaço livre
     sa.espaco_livre += arquivo->tamanho;
@@ -397,7 +384,6 @@ void apagar(const char* nome) {
 
     printf("Arquivo '%s' excluído com sucesso\n", nome);
 }
-
 
 // Concatenar
 void concatenar(const char* nome1, const char* nome2) {
@@ -448,11 +434,182 @@ void concatenar(const char* nome1, const char* nome2) {
     sa.espaco_livre -= novo_tamanho;
 }
 
+// Listar
+void listar() {
+    printf("Arquivos:\n");
+    for (int i = 0; i < sa.quantidade_arquivos; i++) {
+        printf("%s - %zu bytes\n", sa.arquivos[i].nome, sa.arquivos[i].tamanho);
+    }
+    printf("\nEspaço total: %llu bytes\n", DISK_SIZE);
+    printf("Espaço livre: %zu bytes\n", sa.espaco_livre);
+}
+
+// Ler
+void ler(const char* nome, int inicio, int fim) {
+    Arquivo* arquivo = NULL;
+    for (int i = 0; i < sa.quantidade_arquivos; i++) {
+        if (strcmp(sa.arquivos[i].nome, nome) == 0) {
+            arquivo = &sa.arquivos[i];
+            break;
+        }
+    }
+    
+    if (arquivo == NULL) {
+        printf("Error: Arquivo '%s' não encontrado\n", nome);
+        return;
+    }
+
+    int num_count = arquivo->tamanho / sizeof(int);
+    
+    if (inicio < 0 || fim >= num_count || inicio > fim) {
+        printf("Error: Invalid range\n");
+        return;
+    }
+
+    int* buffer = malloc(arquivo->tamanho);
+    if (!buffer) {
+        printf("Erro: Falha ao alocar memória\n");
+        return;
+    }
+
+    fseek(disco_virtual, arquivo->posicao, SEEK_SET);
+    fread(buffer, sizeof(int), num_count, disco_virtual);
+
+    printf("Números %d a %d no arquivo '%s':\n", inicio, fim, nome);
+    for (int i = inicio; i <= fim; i++) {
+        printf("%d ", buffer[i]);
+    }
+    printf("\n");
+
+  // Liberar memória
+  free(buffer);
+}
+
+// void criar(const char* nome, int tamanho) {
+    
+//     size_t file_size = tamanho * sizeof(int); // Tamanho do arquivo em bytes
+//     if (file_size > sa.espaco_livre) {
+//         printf("Erro: Sem espaço suficiente\n");
+//         return;
+//     }
+    
+//     Arquivo* arquivo = &sa.arquivos[sa.quantidade_arquivos++];
+//     strcpy(arquivo->nome, nome);
+//     arquivo->tamanho = file_size;
+//     arquivo->posicao = DISK_SIZE - sa.espaco_livre;
+//     sa.espaco_livre -= file_size;
+    
+
+//     // Criar e armazenar números aleatórios no arquivo
+//     int* numbers = malloc(file_size); // Permitido usar
+//     if (!numbers) {
+//         printf("Erro: Falha ao alocar memória para os números\n");
+//         return;
+//     }
+
+//     for (int i = 0; i < tamanho; i++) {
+//         numbers[i] = rand() % 1000000; // Números aleatórios entre 0 e 999999
+//     }
+
+//     // Posicionar ponteiro do arquivo na posição correta e escrever os dados
+//     fseek(disco_virtual, arquivo->posicao, SEEK_SET);
+//     fwrite(numbers, sizeof(int), tamanho, disco_virtual);
+//     fflush(disco_virtual);  // Garante que os dados são gravados imediatamente
+
+//     free(numbers); // Liberar memória após a gravação
+
+//     printf("Arquivo '%s' criado com sucesso\n", nome);
+// }
+
+
+// apagar
+// void apagar(const char* nome) {
+//     int indice = -1;
+
+//     // Procurar pelo arquivo na lista
+//     for (int i = 0; i < sa.quantidade_arquivos; i++) {
+//         if (strcmp(sa.arquivos[i].nome, nome) == 0) {
+//             indice = i;
+//             break;
+//         }
+//     }
+
+//     // Se não encontrou, retorna erro
+//     if (indice == -1) {
+//         printf("Erro: Arquivo '%s' não encontrado\n", nome);
+//         return;
+//     }
+
+//     Arquivo* arquivo = &sa.arquivos[indice];
+
+//     // Limpar o espaço do arquivo no disco
+//     char* buffer = calloc(1, arquivo->tamanho);  // Buffer zerado
+//     if (!buffer) {
+//         printf("Erro: Falha ao alocar memória para apagar arquivo\n");
+//         return;
+//     }
+
+//     fseek(disco_virtual, arquivo->posicao, SEEK_SET);
+//     fwrite(buffer, 1, arquivo->tamanho, disco_virtual);
+//     fflush(disco_virtual);  // Garante que os dados são gravados
+//     free(buffer);  // Libera a memória
+
+//     // Atualizar espaço livre
+//     sa.espaco_livre += arquivo->tamanho;
+
+//     // Remover o arquivo da lista de arquivos
+//     for (int j = indice; j < sa.quantidade_arquivos - 1; j++) {
+//         sa.arquivos[j] = sa.arquivos[j + 1];
+//     }
+
+//     sa.quantidade_arquivos--;
+
+//     printf("Arquivo '%s' excluído com sucesso\n", nome);
+// }
+
+
+int comparar(const void* a, const void* b) {
+    return (*(int*)a - *(int*)b);
+}
 
 // Ordenar: implementar por último
 void ordenar(const char* nome) {
-    printf("ORDENAR\n");
-};
+    Arquivo* arquivo = NULL;
+    for (int i = 0; i < sa.quantidade_arquivos; i++) {
+        if (strcmp(sa.arquivos[i].nome, nome) == 0) {
+            arquivo = &sa.arquivos[i];
+            break;
+        }
+    }
+
+    if (!arquivo) {
+        printf("Erro: Arquivo '%s' não encontrado\n", nome);
+        return;
+    }
+
+    size_t tamanho = arquivo->tamanho / sizeof(int);
+    int* numbers = mmap(NULL, HUGE_PAGE_SIZE, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (numbers == MAP_FAILED) {
+        printf("Erro: Falha ao alocar Huge Page\n");
+        return;
+    }
+
+    fseek(disco_virtual, arquivo->posicao, SEEK_SET);
+    fread(numbers, sizeof(int), tamanho, disco_virtual);
+
+    // Ordena os números usando QuickSort
+    qsort(numbers, tamanho, sizeof(int), comparar);
+
+    fseek(disco_virtual, arquivo->posicao, SEEK_SET);
+    fwrite(numbers, sizeof(int), tamanho, disco_virtual);
+    fflush(disco_virtual);
+
+    munmap(numbers, HUGE_PAGE_SIZE);
+    printf("Arquivo '%s' ordenado com sucesso\n", nome);
+}
+
+
 
 
 // void allocate_huge_page() {
@@ -483,31 +640,11 @@ void ordenar(const char* nome) {
 //     close(fd);
 // }
 
-void* allocate_huge_page() {
-    void* huge_page = mmap(NULL, HUGE_PAGE_SIZE, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-    if (huge_page == MAP_FAILED) {
-        fprintf(stderr, "Failed to allocate huge page: %s\n", strerror(errno));
-
-        // Fallback: tentar mmap normal
-        huge_page = mmap(NULL, HUGE_PAGE_SIZE, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (huge_page == MAP_FAILED) {
-            fprintf(stderr, "Fallback allocation also failed: %s\n", strerror(errno));
-            return NULL;
-        } else {
-            printf("Allocated normal page instead of huge page\n");
-        }
-    } else {
-        printf("Successfully allocated huge page\n");
-    }
-    return huge_page;
-}
 
 int main() {
 
     iniciar_sistema_arquivos();
-    allocate_huge_page();
+    // allocate_huge_page();
 
     char command[20];
     char arg1[MAX_FILENAME_LENGTH], arg2[MAX_FILENAME_LENGTH];
